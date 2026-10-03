@@ -1,0 +1,28 @@
+diff --git a/target/linux/ramips/dts/mt7620a_zbtlink_zbt-we826.dtsi b/target/linux/ramips/dts/mt7620a_zbtlink_zbt-we826.dtsi
+index d29c3f1..9b9f382 100644
+--- a/target/linux/ramips/dts/mt7620a_zbtlink_zbt-we826.dtsi
++++ b/target/linux/ramips/dts/mt7620a_zbtlink_zbt-we826.dtsi
+@@ -138,13 +138,22 @@
+ };
+ 
+ &wmac {
++	/*
++	 * EEPROM NIC_CONF1 declares an external PA on TX0/TX1 and an external
++	 * LNA on 2.4 GHz. rt2x00 needs "default" (pa function, front-end live)
++	 * and "pa_gpio" (gpio function, used only while calibrating).
++	 */
++	pinctrl-names = "default", "pa_gpio";
++	pinctrl-0 = <&pa_pins>;
++	pinctrl-1 = <&pa_gpio_pins>;
++
+ 	nvmem-cells = <&eeprom_factory_0>;
+ 	nvmem-cell-names = "eeprom";
+ };
+ 
+ &state_default {
+ 	default {
+-		groups = "i2c", "uartf", "wled", "spi refclk", "pa";
++		groups = "i2c", "uartf", "wled", "spi refclk";
+ 		function = "gpio";
+ 	};
+ };

@@ -1,0 +1,17 @@
+# Local build trees and hardware-reference material
+/openwrt/
+/vendor-driver/
+
+# Private working notes; public documentation is README.md and TODO_rt2x00.md
+/TODO.md
+/TROUBLESHOOTING.md
+
+# Local agent and machine configuration
+/.agents/
+/.codex/
+/.aws/
+.env
+.env.*
+*.log
+__pycache__/
+*.pyc

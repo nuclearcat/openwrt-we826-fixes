@@ -1,0 +1,29 @@
+diff --git a/target/linux/ramips/dts/mt7620a_zbtlink_zbt-we826.dtsi b/target/linux/ramips/dts/mt7620a_zbtlink_zbt-we826.dtsi
+index 91601f6..d29c3f1 100644
+--- a/target/linux/ramips/dts/mt7620a_zbtlink_zbt-we826.dtsi
++++ b/target/linux/ramips/dts/mt7620a_zbtlink_zbt-we826.dtsi
+@@ -91,6 +91,10 @@
+ 						reg = <0x0 0x200>;
+ 					};
+ 
++					eeprom_factory_8000: eeprom@8000 {
++						reg = <0x8000 0x200>;
++					};
++
+ 					macaddr_factory_4: macaddr@4 {
+ 						reg = <0x4 0x6>;
+ 					};
+@@ -148,3 +152,13 @@
+ &pcie {
+ 	status = "okay";
+ };
++
++&pcie0 {
++	wifi@0,0 {
++		compatible = "pci14c3,7662";
++		reg = <0x0000 0 0 0 0>;
++		nvmem-cells = <&eeprom_factory_8000>;
++		nvmem-cell-names = "eeprom";
++		ieee80211-freq-limit = <5000000 6000000>;
++	};
++};

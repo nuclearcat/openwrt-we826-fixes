@@ -1,0 +1,339 @@
+From: ZBT WE826 debugging
+Subject: [PATCH] rt2x00: mt7620: track die temperature, refresh DPD and PA bias
+
+rt2x00 calibrates MT7620 once at bring-up and then runs open loop forever:
+
+    void rt2800_gain_calibration(struct rt2x00_dev *rt2x00dev)
+    {
+            if (rt2x00_rt(rt2x00dev, RT6352))
+                    return;
+
+and there is a bare "TODO: temperature compensation code!" elsewhere. Nothing
+tracks the die temperature, so both the PA bias and the DPD pre-distortion
+table drift away from the conditions they were measured at.
+
+Read the die temperature from BBP 49 via BBP 47. Use raw differences for
+DPD drift, so no assumed initial die temperature is needed. Hang this off the
+existing gain_calibration hook (approximately every four seconds).
+
+Bias compensation uses the signed factory reference at EEPROM byte 0xd1.
+If it is unprogrammed (0xff), leave bias unchanged. Restrict these settings
+to devices with internal PA and LNA. Below approximately 20 C select low
+bias, retaining it until temperature exceeds approximately 30 C.
+
+DPD returns separate skipped, failed and successful outcomes. Only success
+with a contemporaneous temperature sample establishes a valid baseline.
+Rate-limit all attempts to once per minute, independently of table validity;
+failed or skipped calibration can retry without further temperature drift.
+The normal bring-up/channel calibration path runs immediately and reapplies
+bias before measuring DPD.
+
+The DPD refresh trigger is NOT a port: in the vendor driver that path is
+reachable only with internal TX ALC enabled (RT635xTriggerTssiCompensation),
+which needs factory TSSI calibration. On boards without it the vendor computes
+the temperature delta and discards it. The threshold and rate limit here are
+therefore a local design decision, not vendor-derived.
+
+Note the vendor polls temperature at ~1 s with a 100 ms retry when the ADC is
+busy; 4 s with a short in-line wait is used here instead, which is ample for a
+thermal time constant measured in minutes.
+
+Depends on 999a (DPD calibration).
+
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
+@@ -5572,10 +5572,19 @@
+ 		rt2800_config_txpower_rt28xx(rt2x00dev, chan, power_level);
+ }
+ 
++static void rt2800_temperature_tick(struct rt2x00_dev *rt2x00dev);
++
+ void rt2800_gain_calibration(struct rt2x00_dev *rt2x00dev)
+ {
+-	if (rt2x00_rt(rt2x00dev, RT6352))
++	if (rt2x00_rt(rt2x00dev, RT6352)) {
++		/*
++		 * No TX power gain calibration for MT7620, but this is the
++		 * periodic hook -- use it to track die temperature so the
++		 * DPD table and PA bias do not go stale.
++		 */
++		rt2800_temperature_tick(rt2x00dev);
+ 		return;
++	}
+ 
+ 	rt2800_config_txpower(rt2x00dev, rt2x00dev->hw->conf.chandef.chan,
+ 			      rt2x00dev->tx_power);
+@@ -10487,6 +10496,132 @@
+ 	rt2800_r_calibration(rt2x00dev);
+ }
+ 
++enum rt2800_dpd_result {
++	RT2800_DPD_SKIPPED,
++	RT2800_DPD_FAILED,
++	RT2800_DPD_SUCCESS,
++};
++
++static enum rt2800_dpd_result
++rt2800_run_dpd_calibration(struct rt2x00_dev *rt2x00dev);
++
++/*
++ * MT7620 die temperature. BBP 47 bit 4 is the ADC busy flag; the low bits
++ * select which sensor feeds BBP 49. Returns -EBUSY while a conversion is
++ * still in flight, in which case the caller simply tries again next tick.
++ */
++static int rt2800_read_temperature(struct rt2x00_dev *rt2x00dev, s8 *temp)
++{
++	u8 bbp;
++	int i;
++
++	bbp = rt2800_bbp_read(rt2x00dev, 47);
++	if (!(bbp & 0x10)) {
++		bbp |= 0x10;
++		rt2800_bbp_write(rt2x00dev, 47, bbp);
++	}
++
++	for (i = 0; i < 3; i++) {
++		bbp = rt2800_bbp_read(rt2x00dev, 47);
++		if (!(bbp & 0x10))
++			break;
++		usleep_range(1000, 2000);
++	}
++
++	if (bbp & 0x10)
++		return -EBUSY;
++
++	bbp &= 0xf8;
++	bbp |= 0x04;
++	rt2800_bbp_write(rt2x00dev, 47, bbp);
++
++	*temp = (s8)rt2800_bbp_read(rt2x00dev, 49);
++
++	return 0;
++}
++
++/*
++ * Below roughly 20 C the mixer/PA bias needs backing off. Hysteresis: once
++ * tripped, only restore above roughly 30 C. temp_dc is 0.1 C units relative
++ * to the factory 25 C reference. Without that reference, leave bias alone.
++ */
++static void rt2800_temperature_compensate(struct rt2x00_dev *rt2x00dev,
++					  s8 temp, bool force)
++{
++	struct rt2800_drv_data *drv_data = rt2x00dev->drv_data;
++	u8 ref;
++	int temp_dc;
++	bool low;
++
++	/* These bias settings are only established for an internal front end. */
++	if (rt2x00_has_cap_external_pa(rt2x00dev) ||
++	    rt2x00_has_cap_external_lna_bg(rt2x00dev))
++		return;
++
++	/* Byte 0xd1 is the signed factory reading at 25 C; 0xff is blank. */
++	ref = rt2800_eeprom_read(rt2x00dev, EEPROM_TXPOWER_INIT) >> 8;
++	if (ref == 0xff)
++		return;
++
++	temp_dc = (temp - (s8)ref) * 19;
++
++	if (temp_dc < -50)
++		low = true;
++	else if (drv_data->temp_low && temp_dc <= 50)
++		low = true;	/* stay latched through the hysteresis band */
++	else
++		low = false;
++
++	if (!force && low == drv_data->temp_low)
++		return;
++
++	rt2800_rfcsr_write_bank(rt2x00dev, 4, 4, low ? 0x06 : 0x00);
++	rt2800_rfcsr_write_bank(rt2x00dev, 6, 4, low ? 0x06 : 0x00);
++	rt2800_rfcsr_write_bank(rt2x00dev, 4, 10, low ? 0x41 : 0x51);
++	rt2800_rfcsr_write_bank(rt2x00dev, 6, 10, low ? 0x41 : 0x51);
++
++	drv_data->temp_low = low;
++	rt2x00_dbg(rt2x00dev, "temp: %s-temperature bias (%d.%d C rel 25C)\n",
++		   low ? "low" : "normal", temp_dc / 10, abs(temp_dc % 10));
++}
++
++/* Threshold and rate limit for re-running DPD, in 0.1 C and jiffies. */
++#define RT2800_DPD_REDO_DELTA_DC	100
++#define RT2800_DPD_REDO_MIN_GAP		(60 * HZ)
++
++/*
++ * Periodic temperature tick for MT7620, driven off gain_calibration (~4 s).
++ * rt2x00 otherwise calibrates once at bring-up and runs open loop forever.
++ */
++static void rt2800_temperature_tick(struct rt2x00_dev *rt2x00dev)
++{
++	struct rt2800_drv_data *drv_data = rt2x00dev->drv_data;
++	s8 temp;
++
++	if (rt2x00_has_cap_external_pa(rt2x00dev))
++		return;
++
++	if (rt2800_read_temperature(rt2x00dev, &temp))
++		return;
++
++	rt2800_temperature_compensate(rt2x00dev, temp, false);
++
++	/* Raw deltas need no guessed absolute-temperature reference. */
++	if (drv_data->dpd_valid &&
++	    abs((temp - drv_data->dpd_temp) * 19) < RT2800_DPD_REDO_DELTA_DC)
++		return;
++
++	/* Rate-limit every attempt, including failures and power-gate skips. */
++	if (drv_data->dpd_attempted &&
++	    time_before(jiffies, drv_data->dpd_last_attempt + RT2800_DPD_REDO_MIN_GAP))
++		return;
++
++	if (rt2800_run_dpd_calibration(rt2x00dev) == RT2800_DPD_SUCCESS) {
++		drv_data->dpd_temp = temp;
++		drv_data->dpd_valid = true;
++	}
++}
++
+ /*
+  * Receive VGA gain codes for the DPD loopback path, written to RF bank 5
+  * (TX0) or bank 7 (TX1) registers 3 and 4. Index order is increasing gain,
+@@ -10792,6 +10927,64 @@
+ 	return success;
+ }
+ 
++/*
++ * Run DPD for every TX chain and drop any table slot that did not converge.
++ * Called at bring-up and again when the die temperature has drifted far from
++ * the point the current table was measured at.
++ */
++static enum rt2800_dpd_result
++rt2800_run_dpd_calibration(struct rt2x00_dev *rt2x00dev)
++{
++	struct rt2800_drv_data *drv_data = rt2x00dev->drv_data;
++	u8 tx_chains = rt2x00dev->default_ant.tx_chain_num;
++	bool tx0_ok, tx1_ok = true;
++	int target_power;
++	u32 alc;
++
++	/* A failed/skipped attempt must never certify a fresh table. */
++	drv_data->dpd_valid = false;
++	drv_data->dpd_attempted = true;
++	drv_data->dpd_last_attempt = jiffies;
++
++	/*
++	 * The vendor flow only runs DPD between 15 and 20 dBm; outside that
++	 * window the pre-distortion table is not trustworthy. TX_ALC_CFG_0
++	 * CH_INIT_0 is in 0.5 dB steps.
++	 */
++	alc = rt2800_register_read(rt2x00dev, TX_ALC_CFG_0);
++	target_power = rt2x00_get_field32(alc, TX_ALC_CFG_0_CH_INIT_0);
++
++	if (target_power < 30 || target_power > 40) {
++		rt2x00_dbg(rt2x00dev,
++			   "DPD: skipped, target power %d (need 30..40)\n",
++			   target_power);
++		return RT2800_DPD_SKIPPED;
++	}
++
++	tx0_ok = rt2800_dpd_calibrate_chain(rt2x00dev, 0);
++	if (tx_chains > 1)
++		tx1_ok = rt2800_dpd_calibrate_chain(rt2x00dev, 1);
++
++	/*
++	 * Clear any DPD table slot that did not converge, so the BBP does not
++	 * apply a bad pre-distortion curve.
++	 */
++	if (!tx0_ok) {
++		rt2800_bbp_write(rt2x00dev, 186, 0x02);
++		rt2800_bbp_write(rt2x00dev, 189, 0x0f);
++	}
++	if (tx_chains > 1 && !tx1_ok) {
++		rt2800_bbp_write(rt2x00dev, 186, 0x04);
++		rt2800_bbp_write(rt2x00dev, 189, 0x0f);
++	}
++
++	rt2x00_dbg(rt2x00dev, "DPD: TX0 %s, TX1 %s\n",
++		   tx0_ok ? "ok" : "failed",
++		   (tx_chains > 1) ? (tx1_ok ? "ok" : "failed") : "n/a");
++
++	return tx0_ok && tx1_ok ? RT2800_DPD_SUCCESS : RT2800_DPD_FAILED;
++}
++
+ static void rt2800_calibration_rt6352_stage2(struct rt2x00_dev *rt2x00dev)
+ {
+ 	u32 reg;
+@@ -10808,45 +11001,20 @@
+ 	 * the external-PA path further down.
+ 	 */
+ 	if (!rt2x00_has_cap_external_pa(rt2x00dev)) {
+-		u8 tx_chains = rt2x00dev->default_ant.tx_chain_num;
+-		bool tx0_ok, tx1_ok = true;
+-		u32 alc;
+-		int target_power;
+-
+-		/*
+-		 * The vendor flow only runs DPD between 15 and 20 dBm; outside
+-		 * that window the pre-distortion table is not trustworthy.
+-		 * TX_ALC_CFG_0 CH_INIT_0 is in 0.5 dB steps.
+-		 */
+-		alc = rt2800_register_read(rt2x00dev, TX_ALC_CFG_0);
+-		target_power = rt2x00_get_field32(alc, TX_ALC_CFG_0_CH_INIT_0);
+-
+-		if (target_power < 30 || target_power > 40) {
+-			rt2x00_dbg(rt2x00dev,
+-				   "DPD: skipped, target power %d (need 30..40)\n",
+-				   target_power);
+-		} else {
+-			tx0_ok = rt2800_dpd_calibrate_chain(rt2x00dev, 0);
+-			if (tx_chains > 1)
+-				tx1_ok = rt2800_dpd_calibrate_chain(rt2x00dev, 1);
+-
+-			/*
+-			 * Clear any DPD table slot that did not converge, so the
+-			 * BBP does not apply a bad pre-distortion curve.
+-			 */
+-			if (!tx0_ok) {
+-				rt2800_bbp_write(rt2x00dev, 186, 0x02);
+-				rt2800_bbp_write(rt2x00dev, 189, 0x0f);
+-			}
+-			if (tx_chains > 1 && !tx1_ok) {
+-				rt2800_bbp_write(rt2x00dev, 186, 0x04);
+-				rt2800_bbp_write(rt2x00dev, 189, 0x0f);
+-			}
+-
+-			rt2x00_dbg(rt2x00dev, "DPD: TX0 %s, TX1 %s\n",
+-				   tx0_ok ? "ok" : "failed",
+-				   (tx_chains > 1) ?
+-					(tx1_ok ? "ok" : "failed") : "n/a");
++		struct rt2800_drv_data *drv_data = rt2x00dev->drv_data;
++		bool have_temp;
++		s8 temp;
++
++		/* Reapply bias and reset hysteresis for this calibration cycle. */
++		drv_data->temp_low = false;
++		have_temp = !rt2800_read_temperature(rt2x00dev, &temp);
++		if (have_temp)
++			rt2800_temperature_compensate(rt2x00dev, temp, true);
++
++		if (rt2800_run_dpd_calibration(rt2x00dev) == RT2800_DPD_SUCCESS &&
++		    have_temp) {
++			drv_data->dpd_temp = temp;
++			drv_data->dpd_valid = true;
+ 		}
+ 	}
+ 
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800lib.h
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800lib.h
+@@ -42,6 +42,13 @@
+ 	u8 txmixer_gain_5g;
+ 	u8 max_psdu;
+ 	unsigned int tbtt_tick;
++
++	/* MT7620 temperature tracking (see rt2800_temperature_tick) */
++	bool temp_low;
++	bool dpd_valid;
++	bool dpd_attempted;
++	s8 dpd_temp;
++	unsigned long dpd_last_attempt;
+ 	unsigned int ampdu_factor_cnt[4];
+ 	DECLARE_BITMAP(sta_ids, STA_IDS_SIZE);
+ 	struct ieee80211_sta *wcid_to_sta[STA_IDS_SIZE];

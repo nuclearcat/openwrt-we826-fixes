@@ -1,0 +1,43 @@
+From: ZBT WE826 debugging
+Subject: [PATCH] rt2x00: clear external LNA cap too when NIC_CONF2 is blank
+
+Follow-up to 998. On boards whose vendor EEPROM carries reference-design
+defaults in NIC_CONF1, the external LNA claim (EXTERNAL_LNA_2G) is as bogus as
+the external PA claim, and comes from the same word. Clearing only the PA bits
+leaves the receive chain configured for a front-end that is not fitted:
+
+  rt2800_config_channel()      RFCSR42 0xdb instead of 0x5b (chipver>1,eco>=2)
+  rt2800_bbp_glrt_write(141)   0x1a instead of 0x10/0x15
+  rt6352 calibration stage2    BBP 75/76/79/80/82 set to eLNA values
+                               (0x68/0x4c/0x1c/0x0c/0xb6)
+
+and the early-out in the RT6352 calibration path
+
+  if (!rt2x00_has_cap_external_pa(dev) && !rt2x00_has_cap_external_lna_bg(dev))
+          return;
+
+is not taken while the LNA bit survives, so the whole external front-end block
+still runs.
+
+Measured on a Zbtlink ZBT-WE826 (MT7620A ver:2 eco:6) after 998 alone: the
+client saw the AP at -38 dBm while the AP saw the client at -80 dBm -- a 40 dB
+asymmetry on a reciprocal RF path, with receive throughput roughly half of what
+the negotiated MCS should deliver.
+
+Note this is weaker than 998 on principle: NIC_CONF2 has an EXTERNAL_PA field
+but no corresponding LNA field, so this infers the LNA claim is untrustworthy
+from the PA claim being untrustworthy in the same word. Justified empirically
+for boards with an unprogrammed NIC_CONF2; would need a per-board opt-out
+before going upstream.
+
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
+@@ -11429,6 +11429,8 @@ static int rt2800_init_eeprom(struct rt2
+ 			__clear_bit(CAPABILITY_EXTERNAL_PA_TX0,
+ 				    &rt2x00dev->cap_flags);
+ 			__clear_bit(CAPABILITY_EXTERNAL_PA_TX1,
++				    &rt2x00dev->cap_flags);
++			__clear_bit(CAPABILITY_EXTERNAL_LNA_BG,
+ 				    &rt2x00dev->cap_flags);
+ 		}
+ 	}

@@ -1,0 +1,36 @@
+From: ZBT WE826 debugging
+Subject: [PATCH] rt2x00: don't trust NIC_CONF1 external PA bits when NIC_CONF2 is blank
+
+On RT6352 (MT7620) the external PA claim in EEPROM word NIC_CONF1 is
+cross-checked against NIC_CONF2's EXTERNAL_PA bit, and cleared when
+NIC_CONF2 does not confirm it. That cross-check is skipped entirely when
+NIC_CONF2 reads 0 or 0xffff.
+
+Several boards (e.g. Zbtlink ZBT-WE826) ship a vendor EEPROM carrying
+reference-design defaults in NIC_CONF1 -- external PA on TX0/TX1 -- while
+NIC_CONF2 is left unprogrammed at 0xffff. The cross-check is therefore
+bypassed and the driver configures the RF front-end for an external PA
+that is not fitted: RFCSR41/42 internal-PA bits are left clear and
+RFCSR51..58 are programmed with the reduced external-PA drive levels
+(e.g. RFCSR51 0x52 instead of 0x7f). The internal PA is deliberately
+under-driven to leave headroom for a stage that does not exist, costing
+roughly 15 dB of output.
+
+An unprogrammed NIC_CONF2 is not evidence of an external PA, so treat it
+the same as an explicit "no external PA" rather than as permission to
+trust NIC_CONF1 alone.
+
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
+@@ -11184,8 +11184,9 @@ static int rt2800_init_eeprom(struct rt2
+
+ 	eeprom = rt2800_eeprom_read(rt2x00dev, EEPROM_NIC_CONF2);
+
+-	if (rt2x00_rt(rt2x00dev, RT6352) && eeprom != 0 && eeprom != 0xffff) {
+-		if (!rt2x00_get_field16(eeprom,
++	if (rt2x00_rt(rt2x00dev, RT6352)) {
++		if (eeprom == 0 || eeprom == 0xffff ||
++		    !rt2x00_get_field16(eeprom,
+ 					EEPROM_NIC_CONF2_EXTERNAL_PA)) {
+ 			__clear_bit(CAPABILITY_EXTERNAL_PA_TX0,
+ 				    &rt2x00dev->cap_flags);

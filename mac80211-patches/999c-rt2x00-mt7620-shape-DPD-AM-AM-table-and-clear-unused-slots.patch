@@ -1,0 +1,148 @@
+From: ZBT WE826 debugging
+Subject: [PATCH] rt2x00: mt7620: shape the DPD AM-AM table and clear unused slots
+
+999a triggers the BBP's DPD engine and validates the result, but applies the
+measured lookup table raw. The vendor flow does two further things before the
+table goes live, and omitting them leaves pre-distortion active where it should
+not be.
+
+1. Weight the AM-AM curve. Table entries are unsigned, centred on 128. The
+   vendor multiplies each entry's delta from 128 by a per-entry weight in
+   tenths: zero for the bottom 24 entries, 5 for the next 8, 10 for the top 32.
+   Negative deltas are flattened to neutral. The PA is linear at low drive, so
+   the raw measurement down there is mostly noise -- applying it as
+   pre-distortion can degrade EVM rather than improve it.
+
+2. Neutralise DPD slots 0x06..0x0d. Those belong to PA modes this calibration
+   never measures. Left untouched the BBP can apply an arbitrary stored curve
+   when the hardware selects one of them.
+
+Both run with BBP 4 forced to the calibration bandwidth, restored afterwards.
+
+Note on the trigger condition: the vendor gates the AM-AM weighting on
+DPD_Calibration() returning 2, which means "the calibration sequence executed",
+NOT "linearity converged" -- returns 0 and 1 are the power-gate and
+already-covered-by-existing-table cases. So the weighting is applied to every
+chain that ran, including one that failed its linearity check. In this port the
+power gate lives in the caller, so reaching the end of
+rt2800_dpd_calibrate_chain() is always equivalent to the vendor's return 2.
+
+DPD_IQ_Swap_AM_PM_Inversion() is deliberately not ported: the vendor gates it on
+Chip_VerID == 1, an E1-silicon workaround. MT7620A ver:2 does not take it.
+
+Cost: 64 entries x 2 slots x 100 us = ~13 ms per chain, on top of the capture
+itself. Relevant if DPD is re-run periodically (999b).
+
+Depends on 999a.
+
+--- a/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
++++ b/drivers/net/wireless/ralink/rt2x00/rt2800lib.c
+@@ -10928,6 +10928,57 @@
+ }
+ 
+ /*
++ * Per-entry weighting for the measured AM-AM curve, in tenths. The PA is
++ * linear at low drive, so the bottom of the table is forced neutral rather
++ * than applying a correction that is mostly measurement noise; weighting
++ * ramps in over the next eight entries and is full for the top half.
++ */
++static const u8 rt2800_dpd_am_scale[64] = {
++	 0,  0,  0,  0,  0,  0,  0,  0,
++	 0,  0,  0,  0,  0,  0,  0,  0,
++	 0,  0,  0,  0,  0,  0,  0,  0,
++	 5,  5,  5,  5,  5,  5,  5,  5,
++	10, 10, 10, 10, 10, 10, 10, 10,
++	10, 10, 10, 10, 10, 10, 10, 10,
++	10, 10, 10, 10, 10, 10, 10, 10,
++	10, 10, 10, 10, 10, 10, 10, 10,
++};
++
++/*
++ * Shape the AM-AM lookup table the BBP just measured. Entries hold an
++ * unsigned value centred on 128; only compression (positive delta) is
++ * corrected, everything else is flattened back to neutral.
++ */
++static void rt2800_dpd_scale_am_lut(struct rt2x00_dev *rt2x00dev, u8 chain)
++{
++	unsigned int slot, k;
++
++	/* two DPD table slots per chain: 0x02/0x03 for TX0, 0x04/0x05 for TX1 */
++	for (slot = 0; slot < 2; slot++) {
++		rt2800_bbp_write(rt2x00dev, 186,
++				 (chain == 0) ? (0x02 + slot) : (0x04 + slot));
++
++		for (k = 0; k < ARRAY_SIZE(rt2800_dpd_am_scale); k++) {
++			u8 am, scaled;
++			int delta;
++
++			rt2800_bbp_write(rt2x00dev, 187, (4 * k) + 3);
++			am = rt2800_bbp_read(rt2x00dev, 188);
++
++			delta = (int)am - 128;
++			if (rt2800_dpd_am_scale[k] && delta > 0)
++				scaled = 128 +
++					 (delta * rt2800_dpd_am_scale[k]) / 10;
++			else
++				scaled = 128;
++
++			rt2800_bbp_write(rt2x00dev, 188, scaled);
++			udelay(100);
++		}
++	}
++}
++
++/*
+  * Run DPD for every TX chain and drop any table slot that did not converge.
+  * Called at bring-up and again when the die temperature has drifted far from
+  * the point the current table was measured at.
+@@ -10938,7 +10989,9 @@
+ 	struct rt2800_drv_data *drv_data = rt2x00dev->drv_data;
+ 	u8 tx_chains = rt2x00dev->default_ant.tx_chain_num;
+ 	bool tx0_ok, tx1_ok = true;
++	unsigned int slot;
+ 	int target_power;
++	u8 save_bbp4;
+ 	u32 alc;
+ 
+ 	/* A failed/skipped attempt must never certify a fresh table. */
+@@ -10965,6 +11018,10 @@
+ 	if (tx_chains > 1)
+ 		tx1_ok = rt2800_dpd_calibrate_chain(rt2x00dev, 1);
+ 
++	/* post-processing runs with BBP 4 in the calibration bandwidth mode */
++	save_bbp4 = rt2800_bbp_read(rt2x00dev, 4);
++	rt2800_bbp_write(rt2x00dev, 4, (save_bbp4 & ~0x18) | 0x10);
++
+ 	/*
+ 	 * Clear any DPD table slot that did not converge, so the BBP does not
+ 	 * apply a bad pre-distortion curve.
+@@ -10977,6 +11034,29 @@
+ 		rt2800_bbp_write(rt2x00dev, 186, 0x04);
+ 		rt2800_bbp_write(rt2x00dev, 189, 0x0f);
+ 	}
++
++	/*
++	 * Slots 0x06..0x0d belong to PA modes that are never calibrated here.
++	 * Left alone they would let the BBP apply an arbitrary curve whenever
++	 * the hardware selects one of those modes, so neutralise them.
++	 */
++	for (slot = 0x06; slot <= 0x0d; slot++) {
++		rt2800_bbp_write(rt2x00dev, 186, slot);
++		rt2800_bbp_write(rt2x00dev, 186, slot);
++		rt2800_bbp_write(rt2x00dev, 189, 0x0f);
++	}
++
++	/*
++	 * Shape the freshly measured curves. This applies to every chain that
++	 * ran the calibration sequence, including one whose linearity check
++	 * failed -- the vendor keys this off "the sequence executed", not off
++	 * the pass/fail flag.
++	 */
++	rt2800_dpd_scale_am_lut(rt2x00dev, 0);
++	if (tx_chains > 1)
++		rt2800_dpd_scale_am_lut(rt2x00dev, 1);
++
++	rt2800_bbp_write(rt2x00dev, 4, save_bbp4);
+ 
+ 	rt2x00_dbg(rt2x00dev, "DPD: TX0 %s, TX1 %s\n",
+ 		   tx0_ok ? "ok" : "failed",

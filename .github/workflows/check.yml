@@ -1,0 +1,32 @@
+name: Check OpenWrt overlay
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout supported OpenWrt
+        run: git clone --branch v24.10.5 --depth 1 https://github.com/openwrt/openwrt.git openwrt
+      - name: Check shell syntax and driver behavior
+        run: |
+          bash -n apply.sh build.sh
+          python3 tests/test_dpd.py
+          python3 tests/test_temperature.py
+          python3 tests/test_apply.py --openwrt openwrt
+      - name: Check basic profile
+        run: |
+          ./apply.sh --openwrt openwrt --profile we826 --check
+          ./apply.sh --openwrt openwrt --profile we826
+          python3 tests/check_openwrt.py --openwrt openwrt
+      - name: Check experimental profile and rollback
+        run: |
+          ./apply.sh --openwrt openwrt --profile we826-experimental
+          python3 tests/check_openwrt.py --openwrt openwrt
+          ./apply.sh --openwrt openwrt --unapply
+          git -C openwrt diff --exit-code
+          test ! -e openwrt/.we826-fixes.json
